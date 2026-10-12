@@ -1,0 +1,6 @@
+{
+  "name": "CoinPath — Offline Transaction & Safety System",
+  "description": "An offline-first Android and web virtual payment system with cryptographic signatures, duplicate-payment prevention, offline spending limits, Safety Dashboard, and SMS notifications.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CoinPath security tests</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 2rem; max-width: 60rem; }
+  table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
+  th, td { border: 1px solid #bbb; padding: .4rem .6rem; text-align: left; font-size: .9rem; }
+  .pass { background: #e3f6e3; } .fail { background: #fbe0e0; }
+</style>
+</head>
+<body>
+<h1>CoinPath: security test runner</h1>
+<p>Serve this folder over http://localhost (modules do not load from file://), then press the button.</p>
+<button id="run">Run tests</button>
+<table id="out"><thead><tr><th>#</th><th>Case</th><th>Expected</th><th>Actual</th><th>Result</th></tr></thead><tbody></tbody></table>
+
+<script type="module">
+import { clearAll, saveKeys, saveWallet } from './offlineStore.js';
+import { generateWalletKeys } from './cryptoUtil.js';
+import { buildSignedTx, receiveTransaction, sendTransaction } from './transfer.js';
+
+const rows = document.querySelector('#out tbody');
+let n = 0;
+function record(name, expected, actual) {
+  const pass = expected === actual;
+  n++;
+  rows.insertAdjacentHTML('beforeend',
+    `<tr class="${pass ? 'pass' : 'fail'}"><td>${n}</td><td>${name}</td><td>${expected}</td><td>${actual}</td><td>${pass ? 'PASS' : 'FAIL'}</td></tr>`);
+}
+
+document.getElementById('run').onclick = async () => {
+  rows.innerHTML = ''; n = 0;
+  await clearAll();
+
+  const A = await generateWalletKeys();   // HRITIKA
+  const B = await generateWalletKeys();   // JAISHIKA
+  const M = await generateWalletKeys();   // MALLORY (attacker, not registered)
+
+  await saveKeys('HRITIKA', A.privateKey, A.publicJwk);
+  await saveWallet({ wallet_id: 'HRITIKA', balance: 500, public_key: A.publicJwk });
+  await saveKeys('JAISHIKA', B.privateKey, B.publicJwk);
+  await saveWallet({ wallet_id: 'JAISHIKA', balance: 300, public_key: B.publicJwk });
+
+  const mk = (o = {}) => buildSignedTx({ sender: 'HRITIKA', receiver: 'JAISHIKA', amount: 50, privateKey: A.privateKey, ...o });
+  const recv = async (tx, me = 'JAISHIKA') => (await receiveTransaction(JSON.stringify(tx), me));
+
+  // 1. valid transfer
+  let tx = await mk();
+  record('Valid signed transaction', 'ok', (await recv(tx)).ok ? 'ok' : 'rejected');
+
+  // 2. duplicate (same QR scanned twice)
+  record('Same transaction scanned twice', 'duplicate', (await recv(tx)).reason);
+
+  // 3. tampered amount
+  tx = await mk(); tx.amount = 500;
+  record('Amount changed after signing', 'bad_signature', (await recv(tx)).reason);
+
+  // 4. replay of an old transaction
+  tx = await mk({ timestamp: Date.now() - 2 * 60 * 60 * 1000 });
+  record('Old transaction replayed (2h old)', 'expired', (await recv(tx)).reason);
+
+  // 5. unknown sender
+  tx = await mk({ sender: 'MALLORY', privateKey: M.privateKey });
+  record('Sender key not registered', 'unknown_sender', (await recv(tx)).reason);
+
+  // 6. identity forgery: Mallory signs but claims to be HRITIKA
+  tx = await mk({ privateKey: M.privateKey });
+  record('Attacker signs as someone else', 'bad_signature', (await recv(tx)).reason);
+
+  // 7. wrong receiver
+  tx = await mk();
+  record('QR meant for a different wallet', 'wrong_receiver', (await recv(tx, 'SOMEONE_ELSE')).reason);
+
+  // 8. malformed payload
+  record('Garbage QR content', 'malformed', (await receiveTransaction('hello', 'JAISHIKA')).reason);
+
+  // 9. offline spending cap
+  await sendTransaction('HRITIKA', 'JAISHIKA', 150);
+  let capResult = 'allowed';
+  try { await sendTransaction('HRITIKA', 'JAISHIKA', 100); } catch { capResult = 'blocked'; }
+  record('Spend beyond offline cap (150 + 100 > 200)', 'blocked', capResult);
+};
+</script>
+</body>
+</html>
