@@ -1,0 +1,22 @@
+{
+  "appId": "com.coinpath.offlineapp",
+  "appName": "CoinPath",
+  "webDir": "dist",
+  "bundledWebRuntime": false,
+  "server": {
+    "cleartext": true,
+    "androidScheme": "http"
+  },
+  "android": {
+    "allowMixedContent": true,
+    "captureInput": true,
+    "webContentsDebuggingEnabled": true
+  },
+  "plugins": {
+    "LocalNotifications": {
+      "smallIcon": "ic_stat_icon_config_sample",
+      "iconColor": "#2bbfd4",
+      "sound": "beep.wav"
+    }
+  }
+}
