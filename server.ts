@@ -1,500 +1,855 @@
-/**
- * server.ts - CoinPath Full-Stack Dev & Production Server
- *
- * Implements the authoritative CoinPath SQLite database & REST API:
- * - SQLite schema with UNIQUE(tx_id) duplicate-payment constraints
- * - Transactional balance debit/credit atomic updates
- * - Idempotent sync endpoint (/api/transactions/sync)
- * - Offline spending limit verification on server
- * - Safety Dashboard statistics & security event logs
- * - SMS notification mock & Twilio dispatcher
- * - Vite middleware integration for live preview on port 3000
- */
-
-import express from 'express';
-import { DatabaseSync } from 'node:sqlite';
+import express, { Request, Response, NextFunction } from 'express';
+import crypto from 'node:crypto';
 import path from 'node:path';
-import fs from 'node:fs';
-import { fileURLToPath } from 'node:url';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-const app = express();
-const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
-
-app.use(express.json());
+import bcrypt from 'bcryptjs';
+import { db, initDatabase } from './server/db.ts';
+import { verifyP256Signature } from './server/crypto-verify.ts';
 
 // Initialize SQLite database
-const DB_PATH = path.join(__dirname, 'coinpath.db');
-const db = new DatabaseSync(DB_PATH);
+initDatabase();
 
-// Enable WAL mode for high concurrency
-db.exec('PRAGMA journal_mode = WAL;');
-db.exec('PRAGMA foreign_keys = ON;');
+const app = express();
+const PORT = 3000;
 
-// Initialize tables
-db.exec(`
-  CREATE TABLE IF NOT EXISTS wallets (
-    wallet_id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    balance INTEGER NOT NULL DEFAULT 500,
-    offline_limit INTEGER NOT NULL DEFAULT 200,
-    created_at INTEGER NOT NULL
-  );
+app.use((_req, res, next) => {
+  // Explicitly allow camera access for webcams in iframes and top-level pages
+  res.setHeader('Permissions-Policy', 'camera=*');
+  res.setHeader('Feature-Policy', 'camera *');
+  next();
+});
 
-  CREATE TABLE IF NOT EXISTS transactions (
-    tx_id TEXT PRIMARY KEY,
-    sender TEXT NOT NULL,
-    receiver TEXT NOT NULL,
-    amount INTEGER NOT NULL,
-    status TEXT NOT NULL, -- 'confirmed', 'rejected', 'duplicate'
-    note TEXT,
-    timestamp INTEGER NOT NULL,
-    confirmed_at INTEGER NOT NULL,
-    rejection_reason TEXT,
-    signature TEXT
-  );
+app.use(express.json({ limit: '5mb' }));
 
-  CREATE TABLE IF NOT EXISTS safety_audit (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    wallet_id TEXT,
-    event_type TEXT NOT NULL,
-    description TEXT NOT NULL,
-    metadata TEXT,
-    created_at INTEGER NOT NULL
-  );
+// Helper: generate random wallet ID e.g. "CP-8349-2194"
+function generateWalletId(): string {
+  const part1 = Math.floor(1000 + Math.random() * 9000);
+  const part2 = Math.floor(1000 + Math.random() * 9000);
+  return `CP-${part1}-${part2}`;
+}
 
-  CREATE TABLE IF NOT EXISTS sms_logs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    tx_id TEXT NOT NULL,
-    recipient_phone TEXT NOT NULL,
-    message_text TEXT NOT NULL,
-    status TEXT NOT NULL, -- 'sent', 'mock_sent', 'failed'
-    provider TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    UNIQUE(tx_id, recipient_phone)
-  );
+// Helper: generate session token
+function generateToken(): string {
+  return crypto.randomBytes(32).toString('hex');
+}
 
-  CREATE TABLE IF NOT EXISTS notifications (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    wallet_id TEXT NOT NULL,
-    title TEXT NOT NULL,
-    message TEXT NOT NULL,
-    type TEXT NOT NULL DEFAULT 'info',
-    read INTEGER NOT NULL DEFAULT 0,
-    metadata TEXT,
-    created_at INTEGER NOT NULL
-  );
-`);
+// Authentication middleware
+interface AuthenticatedRequest extends Request {
+  user?: {
+    id: number;
+    username: string;
+    email: string;
+    fullName: string;
+    publicKey: string | null;
+    walletId: string;
+    token: string;
+  };
+}
 
-console.log('✓ CoinPath SQLite database initialized at', DB_PATH);
-
-// ==========================================
-// SMS Notification Service Helper
-// ==========================================
-function sendTransactionSMS(txId: string, phone: string, amount: number, sender: string, receiver: string) {
-  const accountSid = process.env.TWILIO_ACCOUNT_SID;
-  const authToken = process.env.TWILIO_AUTH_TOKEN;
-  const fromPhone = process.env.TWILIO_PHONE_NUMBER;
-
-  const messageText = `[CoinPath Alert] Payment of ${amount} coins successfully confirmed. From: ${sender} To: ${receiver}. Ref: ${txId}`;
-
-  // Check if already dispatched for this tx_id (deduplication constraint)
-  try {
-    const existing = db.prepare('SELECT id FROM sms_logs WHERE tx_id = ?').get(txId);
-    if (existing) {
-      console.log(`[SMS Engine] Duplicate SMS suppressed for confirmed tx ${txId}`);
-      return;
-    }
-  } catch (e) {
-    // ignore
+function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Unauthorized: Missing or invalid authentication token.' });
   }
 
-  if (accountSid && authToken && fromPhone) {
-    // Real Twilio credentials present
-    try {
-      const url = `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`;
-      const auth = Buffer.from(`${accountSid}:${authToken}`).toString('base64');
-      const params = new URLSearchParams();
-      params.append('To', phone);
-      params.append('From', fromPhone);
-      params.append('Body', messageText);
+  const token = authHeader.substring(7).trim();
+  try {
+    const session = db.prepare(`
+      SELECT s.token, s.expires_at, u.id, u.username, u.email, u.full_name, u.public_key, u.wallet_id
+      FROM sessions s
+      JOIN users u ON s.user_id = u.id
+      WHERE s.token = ?
+    `).get(token) as any;
 
-      fetch(url, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Basic ${auth}`,
-          'Content-Type': 'application/x-www-form-urlencoded'
-        },
-        body: params.toString()
-      }).then(res => {
-        const status = res.ok ? 'sent' : 'failed';
-        db.prepare(`
-          INSERT OR IGNORE INTO sms_logs (tx_id, recipient_phone, message_text, status, provider, created_at)
-          VALUES (?, ?, ?, ?, ?, ?)
-        `).run(txId, phone, messageText, status, 'twilio', Date.now());
-      }).catch(err => {
-        console.warn('Twilio dispatch error:', err);
-      });
-    } catch (err) {
-      console.warn('Failed to call Twilio:', err);
+    if (!session) {
+      return res.status(401).json({ error: 'Session expired or invalid. Please log in again.' });
     }
-  } else {
-    // Safe mock notification mode
-    console.log(`[SMS Engine (Mock)] Notification dispatched to ${phone}: "${messageText}"`);
-    try {
-      db.prepare(`
-        INSERT OR IGNORE INTO sms_logs (tx_id, recipient_phone, message_text, status, provider, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `).run(txId, phone, messageText, 'mock_sent', 'mock_sandbox', Date.now());
-    } catch (e) {
-      // ignore
+
+    if (new Date(session.expires_at).getTime() < Date.now()) {
+      db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
+      return res.status(401).json({ error: 'Session expired. Please log in again.' });
     }
+
+    req.user = {
+      id: session.id,
+      username: session.username,
+      email: session.email,
+      fullName: session.full_name,
+      publicKey: session.public_key,
+      walletId: session.wallet_id,
+      token: session.token,
+    };
+
+    next();
+  } catch (err: any) {
+    console.error('[Auth] Error verifying session:', err);
+    res.status(500).json({ error: 'Authentication internal error.' });
   }
 }
 
-// ==========================================
-// REST API Routes
-// ==========================================
+// --------------------------------------------------------------------------
+// API ROUTES
+// --------------------------------------------------------------------------
 
 // Health check
-app.get('/api/health', (req, res) => {
+app.get('/api/health', (_req, res) => {
   res.json({
-    status: 'healthy',
-    system: 'CoinPath Server',
-    database: 'SQLite',
-    timestamp: Date.now()
+    status: 'ok',
+    app: 'CoinPath Virtual Wallet',
+    version: '1.0.0',
+    serverTime: new Date().toISOString(),
+    network: 'online',
   });
 });
 
-// Wallet creation / retrieval
-app.post('/api/wallets', (req, res) => {
-  const { wallet_id, name, balance } = req.body;
-  if (!wallet_id || !name) {
-    return res.status(400).json({ error: 'wallet_id and name are required' });
+// Register account
+app.post('/api/auth/register', async (req, res) => {
+  const { username, email, fullName, password, publicKey } = req.body;
+
+  if (!username || !email || !fullName || !password) {
+    return res.status(400).json({ error: 'All fields (username, email, full name, password) are required.' });
   }
 
-  const existing = db.prepare('SELECT * FROM wallets WHERE wallet_id = ?').get(wallet_id) as any;
-  if (existing) {
-    return res.json(existing);
+  const trimmedUsername = String(username).trim().toLowerCase();
+  const trimmedEmail = String(email).trim().toLowerCase();
+  const trimmedName = String(fullName).trim();
+
+  // Validate format
+  if (trimmedUsername.length < 3 || !/^[a-zA-Z0-9_]+$/.test(trimmedUsername)) {
+    return res.status(400).json({ error: 'Username must be at least 3 characters and contain only letters, numbers, and underscores.' });
   }
 
-  const initialBalance = typeof balance === 'number' ? balance : 500;
-  const now = Date.now();
-  db.prepare(`
-    INSERT INTO wallets (wallet_id, name, balance, offline_limit, created_at)
-    VALUES (?, ?, ?, 200, ?)
-  `).run(wallet_id, name, initialBalance, now);
-
-  res.status(201).json({
-    wallet_id,
-    name,
-    balance: initialBalance,
-    offline_limit: 200,
-    created_at: now
-  });
-});
-
-app.get('/api/wallets/:wallet_id', (req, res) => {
-  const wallet = db.prepare('SELECT * FROM wallets WHERE wallet_id = ?').get(req.params.wallet_id);
-  if (!wallet) {
-    return res.status(404).json({ error: 'Wallet not found' });
-  }
-  res.json(wallet);
-});
-
-app.get('/api/wallets/:wallet_id/balance', (req, res) => {
-  const wallet = db.prepare('SELECT balance FROM wallets WHERE wallet_id = ?').get(req.params.wallet_id) as any;
-  if (!wallet) {
-    return res.status(404).json({ error: 'Wallet not found' });
-  }
-  res.json({ wallet_id: req.params.wallet_id, balance: wallet.balance });
-});
-
-// Spending limit configuration
-app.post('/api/wallets/:wallet_id/limits', (req, res) => {
-  const { offline_limit } = req.body;
-  const limit = Math.max(10, Math.floor(Number(offline_limit)));
-  if (!limit) {
-    return res.status(400).json({ error: 'Valid positive offline_limit required' });
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(trimmedEmail)) {
+    return res.status(400).json({ error: 'Please enter a valid email address.' });
   }
 
-  db.prepare('UPDATE wallets SET offline_limit = ? WHERE wallet_id = ?').run(limit, req.params.wallet_id);
-  db.prepare(`
-    INSERT INTO safety_audit (wallet_id, event_type, description, metadata, created_at)
-    VALUES (?, 'LIMIT_UPDATED', ?, ?, ?)
-  `).run(req.params.wallet_id, `Offline limit changed to ${limit}`, JSON.stringify({ offline_limit: limit }), Date.now());
-
-  res.json({ wallet_id: req.params.wallet_id, offline_limit: limit });
-});
-
-// Direct online transaction creation
-app.post('/api/transactions', (req, res) => {
-  const { tx_id, sender, receiver, amount, note, timestamp } = req.body;
-  if (!tx_id || !sender || !receiver || !amount || amount <= 0) {
-    return res.status(400).json({ error: 'Invalid transaction parameters' });
+  if (String(password).length < 6) {
+    return res.status(400).json({ error: 'Password must be at least 6 characters long.' });
   }
 
-  // Check for duplicate transaction
-  const existing = db.prepare('SELECT * FROM transactions WHERE tx_id = ?').get(tx_id) as any;
-  if (existing) {
-    return res.json({
-      status: 'duplicate',
-      message: 'Transaction already processed',
-      transaction: existing
-    });
-  }
-
-  // Ensure wallets exist
-  let senderWallet = db.prepare('SELECT * FROM wallets WHERE wallet_id = ?').get(sender) as any;
-  let receiverWallet = db.prepare('SELECT * FROM wallets WHERE wallet_id = ?').get(receiver) as any;
-
-  if (!senderWallet) {
-    db.prepare('INSERT INTO wallets (wallet_id, name, balance, offline_limit, created_at) VALUES (?, ?, 500, 200, ?)').run(sender, 'Sender User', Date.now());
-    senderWallet = { wallet_id: sender, balance: 500 };
-  }
-  if (!receiverWallet) {
-    db.prepare('INSERT INTO wallets (wallet_id, name, balance, offline_limit, created_at) VALUES (?, ?, 500, 200, ?)').run(receiver, 'Receiver User', Date.now());
-    receiverWallet = { wallet_id: receiver, balance: 500 };
-  }
-
-  if (senderWallet.balance < amount) {
-    return res.status(400).json({ error: 'Insufficient balance' });
-  }
-
-  const now = Date.now();
   try {
-    // Atomic balance update
+    // Check for duplicate username or email
+    const existingUser = db.prepare('SELECT id, username, email FROM users WHERE username = ? OR email = ?').get(trimmedUsername, trimmedEmail) as any;
+    if (existingUser) {
+      if (existingUser.username === trimmedUsername) {
+        return res.status(409).json({ error: 'An account with this username already exists.' });
+      }
+      return res.status(409).json({ error: 'An account with this email address already exists.' });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    // Generate unique wallet ID
+    let walletId = generateWalletId();
+    let collision = db.prepare('SELECT id FROM users WHERE wallet_id = ?').get(walletId);
+    while (collision) {
+      walletId = generateWalletId();
+      collision = db.prepare('SELECT id FROM users WHERE wallet_id = ?').get(walletId);
+    }
+
+    const now = new Date().toISOString();
+    const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+    const token = generateToken();
+
+    // Atomic SQLite transaction to create user and wallet with EXACTLY 500 INITIAL VIRTUAL COINS
     db.exec('BEGIN TRANSACTION;');
-    db.prepare('UPDATE wallets SET balance = balance - ? WHERE wallet_id = ?').run(amount, sender);
-    db.prepare('UPDATE wallets SET balance = balance + ? WHERE wallet_id = ?').run(amount, receiver);
-    db.prepare(`
-      INSERT INTO transactions (tx_id, sender, receiver, amount, status, note, timestamp, confirmed_at)
-      VALUES (?, ?, ?, ?, 'confirmed', ?, ?, ?)
-    `).run(tx_id, sender, receiver, amount, note || '', timestamp || now, now);
-    db.exec('COMMIT;');
-
-    sendTransactionSMS(tx_id, '+1 555-0199', amount, sender, receiver);
-
-    res.status(201).json({
-      status: 'confirmed',
-      tx_id,
-      sender,
-      receiver,
-      amount,
-      confirmed_at: now
-    });
-  } catch (err: any) {
-    db.exec('ROLLBACK;');
-    console.error('Transaction failed:', err);
-    res.status(500).json({ error: 'Transaction failed: ' + err.message });
-  }
-});
-
-// Idempotent batch offline synchronization
-app.post('/api/transactions/sync', (req, res) => {
-  const { transactions } = req.body;
-  if (!Array.isArray(transactions)) {
-    return res.status(400).json({ error: 'transactions array required' });
-  }
-
-  const results: any[] = [];
-  const now = Date.now();
-
-  for (const item of transactions) {
-    const { tx_id, sender, receiver, amount, note, timestamp, signature } = item;
-
-    if (!tx_id || !sender || !receiver || !amount) {
-      results.push({ tx_id: tx_id || 'unknown', status: 'rejected', reason: 'Missing mandatory fields' });
-      continue;
-    }
-
-    // 1. DUPLICATE CHECK: Idempotent processing with SQLite UNIQUE constraint
-    const existing = db.prepare('SELECT * FROM transactions WHERE tx_id = ?').get(tx_id) as any;
-    if (existing) {
-      // Record duplicate attempt in safety audit log
-      db.prepare(`
-        INSERT INTO safety_audit (wallet_id, event_type, description, metadata, created_at)
-        VALUES (?, 'DUPLICATE_SYNC_IGNORED', ?, ?, ?)
-      `).run(sender, `Duplicate transaction attempt detected for ${tx_id}. Safe idempotency maintained.`, JSON.stringify({ tx_id }), now);
-
-      results.push({
-        tx_id,
-        status: 'duplicate',
-        reason: 'Transaction already settled on server. Idempotent response returned without double debit.',
-        confirmed_at: existing.confirmed_at
-      });
-      continue;
-    }
-
-    // 2. Ensure wallets exist
-    let senderWallet = db.prepare('SELECT * FROM wallets WHERE wallet_id = ?').get(sender) as any;
-    let receiverWallet = db.prepare('SELECT * FROM wallets WHERE wallet_id = ?').get(receiver) as any;
-
-    if (!senderWallet) {
-      db.prepare('INSERT INTO wallets (wallet_id, name, balance, offline_limit, created_at) VALUES (?, ?, 500, 200, ?)').run(sender, sender, now);
-      senderWallet = { wallet_id: sender, balance: 500, offline_limit: 200 };
-    }
-    if (!receiverWallet) {
-      db.prepare('INSERT INTO wallets (wallet_id, name, balance, offline_limit, created_at) VALUES (?, ?, 500, 200, ?)').run(receiver, receiver, now);
-      receiverWallet = { wallet_id: receiver, balance: 500, offline_limit: 200 };
-    }
-
-    // 3. BALANCE & SPENDING LIMIT VALIDATION
-    if (amount > senderWallet.offline_limit) {
-      db.prepare(`
-        INSERT INTO transactions (tx_id, sender, receiver, amount, status, note, timestamp, confirmed_at, rejection_reason, signature)
-        VALUES (?, ?, ?, ?, 'rejected', ?, ?, ?, 'Exceeds configured offline spending limit', ?)
-      `).run(tx_id, sender, receiver, amount, note || '', timestamp || now, now, signature || '');
-
-      results.push({
-        tx_id,
-        status: 'rejected',
-        reason: `Exceeds offline spending limit of ${senderWallet.offline_limit} coins`
-      });
-      continue;
-    }
-
-    if (senderWallet.balance < amount) {
-      db.prepare(`
-        INSERT INTO transactions (tx_id, sender, receiver, amount, status, note, timestamp, confirmed_at, rejection_reason, signature)
-        VALUES (?, ?, ?, ?, 'rejected', ?, ?, ?, 'Insufficient balance on authoritative server', ?)
-      `).run(tx_id, sender, receiver, amount, note || '', timestamp || now, now, signature || '');
-
-      results.push({
-        tx_id,
-        status: 'rejected',
-        reason: 'Insufficient wallet balance on authoritative server'
-      });
-      continue;
-    }
-
-    // 4. ATOMIC DATABASE TRANSACTION
     try {
-      db.exec('BEGIN TRANSACTION;');
-      db.prepare('UPDATE wallets SET balance = balance - ? WHERE wallet_id = ?').run(amount, sender);
-      db.prepare('UPDATE wallets SET balance = balance + ? WHERE wallet_id = ?').run(amount, receiver);
       db.prepare(`
-        INSERT INTO transactions (tx_id, sender, receiver, amount, status, note, timestamp, confirmed_at, signature)
-        VALUES (?, ?, ?, ?, 'confirmed', ?, ?, ?, ?)
-      `).run(tx_id, sender, receiver, amount, note || '', timestamp || now, now, signature || '');
+        INSERT INTO users (username, email, full_name, password_hash, public_key, wallet_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(trimmedUsername, trimmedEmail, trimmedName, passwordHash, publicKey || null, walletId, now);
+
+      const createdUser = db.prepare('SELECT id FROM users WHERE username = ?').get(trimmedUsername) as { id: number };
+
+      // Initialize wallet with exactly 500 virtual coins as required by Section 18.B
+      const INITIAL_BALANCE = 500;
+      const DEFAULT_LIMIT = 200;
 
       db.prepare(`
-        INSERT INTO safety_audit (wallet_id, event_type, description, metadata, created_at)
-        VALUES (?, 'OFFLINE_TX_CONFIRMED', ?, ?, ?)
-      `).run(sender, `Offline transaction ${tx_id} validated and settled on server`, JSON.stringify({ tx_id, amount }), now);
+        INSERT INTO wallets (user_id, wallet_id, balance, max_tx_limit, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(createdUser.id, walletId, INITIAL_BALANCE, DEFAULT_LIMIT, now);
 
+      // Record genesis initial credit transaction
+      const initialTxId = `tx_init_${crypto.randomBytes(8).toString('hex')}`;
       db.prepare(`
-        INSERT INTO notifications (wallet_id, title, message, type, metadata, created_at)
-        VALUES (?, 'Payment Confirmed', ?, 'success', ?, ?)
-      `).run(receiver, `Received ${amount} coins from ${sender} (Ref: ${tx_id})`, JSON.stringify({ tx_id, amount }), now);
+        INSERT INTO transactions (id, nonce, sender_wallet_id, receiver_wallet_id, amount, status, sync_status, error_reason, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        initialTxId,
+        'genesis_nonce',
+        'SYSTEM_RESERVE',
+        walletId,
+        INITIAL_BALANCE,
+        'accepted',
+        'online_direct',
+        null,
+        now
+      );
+
+      // Create session
+      db.prepare(`
+        INSERT INTO sessions (token, user_id, created_at, expires_at)
+        VALUES (?, ?, ?, ?)
+      `).run(token, createdUser.id, now, expiresAt);
 
       db.exec('COMMIT;');
 
-      // Dispatch SMS notification after successful server confirmation
-      sendTransactionSMS(tx_id, '+1 555-0199', amount, sender, receiver);
+      res.status(201).json({
+        token,
+        user: {
+          id: createdUser.id,
+          username: trimmedUsername,
+          email: trimmedEmail,
+          fullName: trimmedName,
+          walletId,
+          publicKey: publicKey || null,
+        },
+        wallet: {
+          walletId,
+          balance: INITIAL_BALANCE,
+          maxTxLimit: DEFAULT_LIMIT,
+        },
+      });
+    } catch (txErr) {
+      db.exec('ROLLBACK;');
+      throw txErr;
+    }
+  } catch (err: any) {
+    console.error('[Register] Error creating user:', err);
+    res.status(500).json({ error: 'Failed to create account. Please try again.' });
+  }
+});
 
-      results.push({
-        tx_id,
-        status: 'confirmed',
-        confirmed_at: now
+// Login
+app.post('/api/auth/login', async (req, res) => {
+  const { usernameOrEmail, password } = req.body;
+
+  if (!usernameOrEmail || !password) {
+    return res.status(400).json({ error: 'Please enter both username/email and password.' });
+  }
+
+  const query = String(usernameOrEmail).trim().toLowerCase();
+
+  try {
+    const user = db.prepare(`
+      SELECT u.id, u.username, u.email, u.full_name, u.password_hash, u.public_key, u.wallet_id,
+             w.balance, w.max_tx_limit
+      FROM users u
+      LEFT JOIN wallets w ON u.id = w.user_id
+      WHERE LOWER(u.username) = ? OR LOWER(u.email) = ?
+    `).get(query, query) as any;
+
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid username/email or password.' });
+    }
+
+    const isMatch = await bcrypt.compare(password, user.password_hash);
+    if (!isMatch) {
+      return res.status(401).json({ error: 'Invalid username/email or password.' });
+    }
+
+    const token = generateToken();
+    const now = new Date().toISOString();
+    const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+
+    db.prepare(`
+      INSERT INTO sessions (token, user_id, created_at, expires_at)
+      VALUES (?, ?, ?, ?)
+    `).run(token, user.id, now, expiresAt);
+
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        username: user.username,
+        email: user.email,
+        fullName: user.full_name,
+        walletId: user.wallet_id,
+        publicKey: user.public_key,
+      },
+      wallet: {
+        walletId: user.wallet_id,
+        balance: user.balance,
+        maxTxLimit: user.max_tx_limit,
+      },
+    });
+  } catch (err: any) {
+    console.error('[Login] Error during login:', err);
+    res.status(500).json({ error: 'Internal login error. Please try again.' });
+  }
+});
+
+// Logout
+app.post('/api/auth/logout', requireAuth, (req: AuthenticatedRequest, res) => {
+  try {
+    if (req.user?.token) {
+      db.prepare('DELETE FROM sessions WHERE token = ?').run(req.user.token);
+    }
+    res.json({ success: true, message: 'Logged out successfully.' });
+  } catch (err: any) {
+    console.error('[Logout] Error:', err);
+    res.status(500).json({ error: 'Failed to terminate session.' });
+  }
+});
+
+// Update user public key (for cryptographic keypair association)
+app.post('/api/auth/update-public-key', requireAuth, (req: AuthenticatedRequest, res) => {
+  const { publicKey } = req.body;
+  if (!publicKey || typeof publicKey !== 'string') {
+    return res.status(400).json({ error: 'Invalid public key.' });
+  }
+
+  try {
+    db.prepare('UPDATE users SET public_key = ? WHERE id = ?').run(publicKey, req.user!.id);
+    res.json({ success: true, publicKey });
+  } catch (err: any) {
+    console.error('[UpdatePubKey] Error:', err);
+    res.status(500).json({ error: 'Failed to update public key.' });
+  }
+});
+
+// Get current user wallet details & recent transactions
+app.get('/api/wallet/me', requireAuth, (req: AuthenticatedRequest, res) => {
+  try {
+    const wallet = db.prepare(`
+      SELECT wallet_id, balance, max_tx_limit, updated_at
+      FROM wallets
+      WHERE user_id = ?
+    `).get(req.user!.id) as any;
+
+    if (!wallet) {
+      return res.status(404).json({ error: 'Wallet not found for user.' });
+    }
+
+    const transactions = db.prepare(`
+      SELECT id, nonce, sender_wallet_id, receiver_wallet_id, amount, status, sync_status, error_reason, created_at
+      FROM transactions
+      WHERE sender_wallet_id = ? OR receiver_wallet_id = ?
+      ORDER BY created_at DESC
+      LIMIT 20
+    `).all(wallet.wallet_id, wallet.wallet_id);
+
+    res.json({
+      user: {
+        id: req.user!.id,
+        username: req.user!.username,
+        email: req.user!.email,
+        fullName: req.user!.fullName,
+        walletId: req.user!.walletId,
+        publicKey: req.user!.publicKey,
+      },
+      wallet: {
+        walletId: wallet.wallet_id,
+        balance: wallet.balance,
+        maxTxLimit: wallet.max_tx_limit,
+        updatedAt: wallet.updated_at,
+      },
+      recentTransactions: transactions,
+    });
+  } catch (err: any) {
+    console.error('[WalletMe] Error:', err);
+    res.status(500).json({ error: 'Failed to retrieve wallet information.' });
+  }
+});
+
+// Lookup recipient by wallet ID
+app.get('/api/wallet/recipient/:walletId', (req, res) => {
+  const { walletId } = req.params;
+  if (!walletId) {
+    return res.status(400).json({ error: 'Wallet ID is required.' });
+  }
+
+  try {
+    const recipient = db.prepare(`
+      SELECT u.username, u.full_name, w.wallet_id
+      FROM wallets w
+      JOIN users u ON w.user_id = u.id
+      WHERE w.wallet_id = ?
+    `).get(walletId) as any;
+
+    if (!recipient) {
+      return res.status(404).json({ error: 'Recipient wallet not found. Verify the wallet ID or QR code.' });
+    }
+
+    res.json({
+      exists: true,
+      walletId: recipient.wallet_id,
+      username: recipient.username,
+      fullName: recipient.full_name,
+    });
+  } catch (err: any) {
+    console.error('[RecipientLookup] Error:', err);
+    res.status(500).json({ error: 'Failed to verify recipient.' });
+  }
+});
+
+// Send coins (real atomic transfer with limit enforcement, idempotency, and signature verification)
+app.post('/api/wallet/transfer', requireAuth, (req: AuthenticatedRequest, res) => {
+  const { txId, receiverWalletId, amount, nonce, signature, offlineQueuedAt } = req.body;
+  const senderWalletId = req.user!.walletId;
+
+  // 1. Basic validation
+  if (!txId || typeof txId !== 'string') {
+    return res.status(400).json({ error: 'Transaction ID is required for idempotency.' });
+  }
+
+  if (!receiverWalletId || typeof receiverWalletId !== 'string') {
+    return res.status(400).json({ error: 'Receiver wallet ID is required.' });
+  }
+
+  const cleanReceiverId = receiverWalletId.trim();
+  if (senderWalletId === cleanReceiverId) {
+    return res.status(400).json({ error: 'Cannot transfer virtual coins to your own wallet.' });
+  }
+
+  const numericAmount = Number(amount);
+  if (!Number.isInteger(numericAmount) || numericAmount <= 0) {
+    return res.status(400).json({ error: 'Transfer amount must be a positive integer.' });
+  }
+
+  // 2. Idempotency check: Has this transaction already been processed?
+  const existingTx = db.prepare('SELECT * FROM transactions WHERE id = ?').get(txId) as any;
+  if (existingTx) {
+    // Return existing transaction status without double debiting!
+    const senderWallet = db.prepare('SELECT balance, max_tx_limit FROM wallets WHERE wallet_id = ?').get(senderWalletId) as any;
+    return res.json({
+      status: existingTx.status,
+      transaction: existingTx,
+      balance: senderWallet.balance,
+      message: existingTx.status === 'accepted' ? 'Transaction already processed successfully.' : 'Transaction already recorded with rejection.',
+    });
+  }
+
+  // 3. Sender wallet and limit check
+  const senderWallet = db.prepare('SELECT id, balance, max_tx_limit FROM wallets WHERE wallet_id = ?').get(senderWalletId) as any;
+  if (!senderWallet) {
+    return res.status(404).json({ error: 'Sender wallet not found.' });
+  }
+
+  const maxLimit = senderWallet.max_tx_limit || 200;
+  if (numericAmount > maxLimit) {
+    // Exact requirement Section 6: "Transfer limit exceeded. The maximum allowed per transaction is 200 coins."
+    return res.status(400).json({
+      error: `Transfer limit exceeded. The maximum allowed per transaction is ${maxLimit} coins.`,
+      maxLimit,
+    });
+  }
+
+  // 4. Receiver wallet check
+  const receiverWallet = db.prepare('SELECT id, balance FROM wallets WHERE wallet_id = ?').get(cleanReceiverId) as any;
+  if (!receiverWallet) {
+    return res.status(404).json({ error: 'Receiver wallet does not exist.' });
+  }
+
+  // 5. Balance check
+  if (senderWallet.balance < numericAmount) {
+    return res.status(400).json({
+      error: `Insufficient virtual coins. Available balance: ${senderWallet.balance} coins, requested: ${numericAmount} coins.`,
+    });
+  }
+
+  // 6. Nonce check for replay protection
+  const txNonce = nonce || `nonce_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+  const existingNonce = db.prepare('SELECT nonce FROM nonces WHERE sender_wallet_id = ? AND nonce = ?').get(senderWalletId, txNonce);
+  if (existingNonce) {
+    return res.status(400).json({ error: 'Duplicate nonce detected. Potential replay attack blocked.' });
+  }
+
+  // 7. Signature verification if public key is registered and signature provided
+  if (req.user?.publicKey && signature) {
+    const payload = JSON.stringify({
+      senderWalletId,
+      receiverWalletId: cleanReceiverId,
+      amount: numericAmount,
+      nonce: txNonce,
+    });
+
+    const isSigValid = verifyP256Signature({
+      publicKeySpkiBase64: req.user.publicKey,
+      payload,
+      signatureHex: signature,
+    });
+
+    if (!isSigValid) {
+      return res.status(400).json({ error: 'Cryptographic signature verification failed.' });
+    }
+  }
+
+  // 8. Atomic database transaction to debit sender and credit receiver
+  const now = new Date().toISOString();
+  db.exec('BEGIN TRANSACTION;');
+  try {
+    db.prepare('UPDATE wallets SET balance = balance - ?, updated_at = ? WHERE wallet_id = ?').run(numericAmount, now, senderWalletId);
+    db.prepare('UPDATE wallets SET balance = balance + ?, updated_at = ? WHERE wallet_id = ?').run(numericAmount, now, cleanReceiverId);
+    db.prepare('INSERT INTO nonces (sender_wallet_id, nonce, created_at) VALUES (?, ?, ?)').run(senderWalletId, txNonce, now);
+
+    const syncStatus = offlineQueuedAt ? 'synced_offline' : 'online_direct';
+
+    db.prepare(`
+      INSERT INTO transactions (id, nonce, sender_wallet_id, receiver_wallet_id, amount, status, sync_status, signature, error_reason, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      txId,
+      txNonce,
+      senderWalletId,
+      cleanReceiverId,
+      numericAmount,
+      'accepted',
+      syncStatus,
+      signature || null,
+      null,
+      offlineQueuedAt || now
+    );
+
+    db.exec('COMMIT;');
+
+    const updatedSender = db.prepare('SELECT balance FROM wallets WHERE wallet_id = ?').get(senderWalletId) as any;
+
+    res.json({
+      status: 'accepted',
+      transaction: {
+        id: txId,
+        nonce: txNonce,
+        senderWalletId,
+        receiverWalletId: cleanReceiverId,
+        amount: numericAmount,
+        status: 'accepted',
+        syncStatus,
+        createdAt: offlineQueuedAt || now,
+      },
+      balance: updatedSender.balance,
+      message: `Successfully transferred ${numericAmount} virtual coins to ${cleanReceiverId}.`,
+    });
+  } catch (err: any) {
+    db.exec('ROLLBACK;');
+    console.error('[Transfer] Atomic execution error:', err);
+    res.status(500).json({ error: 'Database transfer failed. Balances were not altered.' });
+  }
+});
+
+// Offline synchronization endpoint
+app.post('/api/wallet/sync-offline', requireAuth, (req: AuthenticatedRequest, res) => {
+  const { transactions } = req.body;
+  const senderWalletId = req.user!.walletId;
+
+  if (!Array.isArray(transactions) || transactions.length === 0) {
+    return res.status(400).json({ error: 'No offline transactions provided for synchronization.' });
+  }
+
+  const results: {
+    synced: any[];
+    rejected: any[];
+    alreadyProcessed: any[];
+  } = {
+    synced: [],
+    rejected: [],
+    alreadyProcessed: [],
+  };
+
+  for (const item of transactions) {
+    const { txId, receiverWalletId, amount, nonce, signature, queuedAt } = item;
+
+    // Check existing
+    const existing = db.prepare('SELECT * FROM transactions WHERE id = ?').get(txId) as any;
+    if (existing) {
+      results.alreadyProcessed.push({ txId, status: existing.status, reason: 'Already in ledger' });
+      continue;
+    }
+
+    const numericAmount = Number(amount);
+    const cleanReceiverId = String(receiverWalletId || '').trim();
+
+    // Check sender
+    const senderWallet = db.prepare('SELECT balance, max_tx_limit FROM wallets WHERE wallet_id = ?').get(senderWalletId) as any;
+    const maxLimit = senderWallet.max_tx_limit || 200;
+
+    // Validation checks
+    let rejectionReason: string | null = null;
+    if (!Number.isInteger(numericAmount) || numericAmount <= 0) {
+      rejectionReason = 'Invalid transfer amount.';
+    } else if (cleanReceiverId === senderWalletId) {
+      rejectionReason = 'Cannot transfer to self.';
+    } else if (numericAmount > maxLimit) {
+      rejectionReason = `Transfer limit exceeded. Maximum per transaction is ${maxLimit} coins.`;
+    } else {
+      const receiver = db.prepare('SELECT id FROM wallets WHERE wallet_id = ?').get(cleanReceiverId);
+      if (!receiver) {
+        rejectionReason = `Receiver wallet ${cleanReceiverId} does not exist.`;
+      } else if (senderWallet.balance < numericAmount) {
+        rejectionReason = `Insufficient balance. Available: ${senderWallet.balance}, requested: ${numericAmount}.`;
+      }
+    }
+
+    // Nonce check
+    const txNonce = nonce || `sync_nonce_${txId}`;
+    if (!rejectionReason) {
+      const existingNonce = db.prepare('SELECT nonce FROM nonces WHERE sender_wallet_id = ? AND nonce = ?').get(senderWalletId, txNonce);
+      if (existingNonce) {
+        rejectionReason = 'Nonce replay detected.';
+      }
+    }
+
+    // Cryptographic signature check if present
+    if (!rejectionReason && req.user?.publicKey && signature) {
+      const payload = JSON.stringify({
+        senderWalletId,
+        receiverWalletId: cleanReceiverId,
+        amount: numericAmount,
+        nonce: txNonce,
+      });
+
+      const isSigValid = verifyP256Signature({
+        publicKeySpkiBase64: req.user.publicKey,
+        payload,
+        signatureHex: signature,
+      });
+
+      if (!isSigValid) {
+        rejectionReason = 'Invalid cryptographic signature.';
+      }
+    }
+
+    const now = new Date().toISOString();
+
+    if (rejectionReason) {
+      // Record rejected transaction to preserve audit history
+      try {
+        db.prepare(`
+          INSERT INTO transactions (id, nonce, sender_wallet_id, receiver_wallet_id, amount, status, sync_status, signature, error_reason, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          txId,
+          txNonce,
+          senderWalletId,
+          cleanReceiverId,
+          numericAmount || 0,
+          'rejected',
+          'failed',
+          signature || null,
+          rejectionReason,
+          queuedAt || now
+        );
+      } catch (err) {
+        console.warn('Failed to record rejected tx:', err);
+      }
+
+      results.rejected.push({
+        txId,
+        receiverWalletId: cleanReceiverId,
+        amount: numericAmount,
+        reason: rejectionReason,
+      });
+      continue;
+    }
+
+    // Apply atomic commit
+    db.exec('BEGIN TRANSACTION;');
+    try {
+      db.prepare('UPDATE wallets SET balance = balance - ?, updated_at = ? WHERE wallet_id = ?').run(numericAmount, now, senderWalletId);
+      db.prepare('UPDATE wallets SET balance = balance + ?, updated_at = ? WHERE wallet_id = ?').run(numericAmount, now, cleanReceiverId);
+      db.prepare('INSERT INTO nonces (sender_wallet_id, nonce, created_at) VALUES (?, ?, ?)').run(senderWalletId, txNonce, now);
+
+      db.prepare(`
+        INSERT INTO transactions (id, nonce, sender_wallet_id, receiver_wallet_id, amount, status, sync_status, signature, error_reason, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        txId,
+        txNonce,
+        senderWalletId,
+        cleanReceiverId,
+        numericAmount,
+        'accepted',
+        'synced_offline',
+        signature || null,
+        null,
+        queuedAt || now
+      );
+
+      db.exec('COMMIT;');
+
+      results.synced.push({
+        txId,
+        receiverWalletId: cleanReceiverId,
+        amount: numericAmount,
+        status: 'accepted',
       });
     } catch (err: any) {
       db.exec('ROLLBACK;');
-      console.error('Sync item failure:', err);
-      results.push({
-        tx_id,
-        status: 'rejected',
-        reason: 'Database error: ' + err.message
+      results.rejected.push({
+        txId,
+        receiverWalletId: cleanReceiverId,
+        amount: numericAmount,
+        reason: 'Database atomic commit failure.',
       });
     }
   }
 
-  res.json({
-    synced_count: results.filter(r => r.status === 'confirmed').length,
-    results
-  });
-});
-
-// Transaction history for a wallet
-app.get('/api/transactions/:wallet_id', (req, res) => {
-  const walletId = req.params.wallet_id;
-  const txs = db.prepare(`
-    SELECT * FROM transactions
-    WHERE sender = ? OR receiver = ?
-    ORDER BY confirmed_at DESC
-  `).all(walletId, walletId);
-  res.json(txs);
-});
-
-// Safety dashboard statistics & audit logs
-app.get('/api/safety/:wallet_id', (req, res) => {
-  const walletId = req.params.wallet_id;
-  const wallet = db.prepare('SELECT * FROM wallets WHERE wallet_id = ?').get(walletId) as any;
-
-  const confirmedCount = (db.prepare(`
-    SELECT COUNT(*) as c FROM transactions WHERE (sender = ? OR receiver = ?) AND status = 'confirmed'
-  `).get(walletId, walletId) as any).c;
-
-  const rejectedCount = (db.prepare(`
-    SELECT COUNT(*) as c FROM transactions WHERE (sender = ? OR receiver = ?) AND status = 'rejected'
-  `).get(walletId, walletId) as any).c;
-
-  const duplicateAttempts = (db.prepare(`
-    SELECT COUNT(*) as c FROM safety_audit WHERE wallet_id = ? AND event_type = 'DUPLICATE_SYNC_IGNORED'
-  `).get(walletId) as any).c;
-
-  const auditEvents = db.prepare(`
-    SELECT * FROM safety_audit WHERE wallet_id = ? OR wallet_id = '' ORDER BY created_at DESC LIMIT 20
-  `).all(walletId);
+  const updatedWallet = db.prepare('SELECT balance FROM wallets WHERE wallet_id = ?').get(senderWalletId) as any;
 
   res.json({
-    wallet_id: walletId,
-    balance: wallet ? wallet.balance : 0,
-    offline_limit: wallet ? wallet.offline_limit : 200,
-    metrics: {
-      confirmed: confirmedCount,
-      rejected: rejectedCount,
-      duplicates_neutralized: duplicateAttempts
+    summary: {
+      total: transactions.length,
+      syncedCount: results.synced.length,
+      rejectedCount: results.rejected.length,
+      alreadyProcessedCount: results.alreadyProcessed.length,
     },
-    audit_events: auditEvents
+    results,
+    currentBalance: updatedWallet.balance,
   });
 });
 
-// In-app notifications
-app.get('/api/notifications/:wallet_id', (req, res) => {
-  const notis = db.prepare(`
-    SELECT * FROM notifications WHERE wallet_id = ? ORDER BY created_at DESC LIMIT 30
-  `).all(req.params.wallet_id);
-  res.json(notis);
+// Transaction history with filters
+app.get('/api/wallet/transactions', requireAuth, (req: AuthenticatedRequest, res) => {
+  const walletId = req.user!.walletId;
+  const filter = (req.query.filter as string) || 'all'; // 'all', 'sent', 'received', 'pending', 'rejected'
+
+  try {
+    let query = `
+      SELECT id, nonce, sender_wallet_id, receiver_wallet_id, amount, status, sync_status, error_reason, created_at
+      FROM transactions
+      WHERE (sender_wallet_id = ? OR receiver_wallet_id = ?)
+    `;
+    const params: any[] = [walletId, walletId];
+
+    if (filter === 'sent') {
+      query += ' AND sender_wallet_id = ?';
+      params.push(walletId);
+    } else if (filter === 'received') {
+      query += ' AND receiver_wallet_id = ?';
+      params.push(walletId);
+    } else if (filter === 'rejected') {
+      query += " AND status = 'rejected'";
+    } else if (filter === 'accepted') {
+      query += " AND status = 'accepted'";
+    }
+
+    query += ' ORDER BY created_at DESC LIMIT 100';
+
+    const txs = db.prepare(query).all(...params);
+    res.json({ transactions: txs });
+  } catch (err: any) {
+    console.error('[Transactions] Error:', err);
+    res.status(500).json({ error: 'Failed to fetch transaction history.' });
+  }
 });
 
-// ==========================================
-// Serve Vite frontend in dev, static in prod
-// ==========================================
-async function startServer() {
-  if (process.env.NODE_ENV === 'production') {
-    app.use(express.static(path.join(__dirname, 'dist')));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(__dirname, 'dist', 'index.html'));
+// Transaction detail
+app.get('/api/wallet/transactions/:txId', requireAuth, (req: AuthenticatedRequest, res) => {
+  const { txId } = req.params;
+  const walletId = req.user!.walletId;
+
+  try {
+    const tx = db.prepare(`
+      SELECT * FROM transactions
+      WHERE id = ? AND (sender_wallet_id = ? OR receiver_wallet_id = ?)
+    `).get(txId, walletId, walletId);
+
+    if (!tx) {
+      return res.status(404).json({ error: 'Transaction not found or access denied.' });
+    }
+
+    res.json({ transaction: tx });
+  } catch (err: any) {
+    console.error('[TxDetail] Error:', err);
+    res.status(500).json({ error: 'Failed to load transaction details.' });
+  }
+});
+
+// Update transfer limit setting
+app.post('/api/wallet/settings/limit', requireAuth, (req: AuthenticatedRequest, res) => {
+  const { maxTxLimit } = req.body;
+  const numericLimit = Number(maxTxLimit);
+
+  if (!Number.isInteger(numericLimit) || numericLimit < 10 || numericLimit > 2000) {
+    return res.status(400).json({ error: 'Transaction limit must be an integer between 10 and 2,000 coins.' });
+  }
+
+  try {
+    db.prepare('UPDATE wallets SET max_tx_limit = ?, updated_at = ? WHERE wallet_id = ?')
+      .run(numericLimit, new Date().toISOString(), req.user!.walletId);
+
+    res.json({
+      success: true,
+      maxTxLimit: numericLimit,
+      message: `Transaction limit updated to ${numericLimit} coins per transfer.`,
     });
-  } else {
-    // In dev mode, mount Vite middleware for instant live reload & static resolution
+  } catch (err: any) {
+    console.error('[SettingsLimit] Error:', err);
+    res.status(500).json({ error: 'Failed to update transaction limit.' });
+  }
+});
+
+// Virtual test coin faucet (safe demo test coin provisioning)
+app.post('/api/wallet/faucet', requireAuth, (req: AuthenticatedRequest, res) => {
+  const walletId = req.user!.walletId;
+  const FAUCET_AMOUNT = 50;
+
+  try {
+    const now = new Date().toISOString();
+    const txId = `tx_faucet_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+
+    db.exec('BEGIN TRANSACTION;');
+    db.prepare('UPDATE wallets SET balance = balance + ?, updated_at = ? WHERE wallet_id = ?').run(FAUCET_AMOUNT, now, walletId);
+    db.prepare(`
+      INSERT INTO transactions (id, nonce, sender_wallet_id, receiver_wallet_id, amount, status, sync_status, error_reason, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      txId,
+      `faucet_nonce_${Date.now()}`,
+      'SYSTEM_RESERVE',
+      walletId,
+      FAUCET_AMOUNT,
+      'accepted',
+      'online_direct',
+      null,
+      now
+    );
+    db.exec('COMMIT;');
+
+    const wallet = db.prepare('SELECT balance FROM wallets WHERE wallet_id = ?').get(walletId) as any;
+
+    res.json({
+      success: true,
+      added: FAUCET_AMOUNT,
+      newBalance: wallet.balance,
+      message: `Added ${FAUCET_AMOUNT} virtual test coins from System Reserve for testing.`,
+    });
+  } catch (err: any) {
+    db.exec('ROLLBACK;');
+    console.error('[Faucet] Error:', err);
+    res.status(500).json({ error: 'Faucet operation failed.' });
+  }
+});
+
+// --------------------------------------------------------------------------
+// VITE DEV SERVER OR STATIC FILE SERVING
+// --------------------------------------------------------------------------
+
+async function startServer() {
+  const isProduction = process.env.NODE_ENV === 'production';
+
+  if (!isProduction) {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
-      appType: 'spa'
+      appType: 'spa',
     });
     app.use(vite.middlewares);
+  } else {
+    const distPath = path.resolve(process.cwd(), 'dist');
+    app.use(express.static(distPath));
+    app.get('*', (_req, res) => {
+      res.sendFile(path.resolve(distPath, 'index.html'));
+    });
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 CoinPath Full-Stack App running at http://localhost:${PORT}`);
+    console.log(`[CoinPath Server] running on http://0.0.0.0:${PORT}`);
   });
 }
 
-startServer().catch(err => {
-  console.error('Failed to start server:', err);
+startServer().catch((err) => {
+  console.error('[Server] Failed to start:', err);
   process.exit(1);
 });
