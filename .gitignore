@@ -6,7 +6,6 @@ coverage/
 *.log
 .env*
 !.env.example
-# Local SQLite database files
 coinpath.db
 coinpath.db-shm
 coinpath.db-wal

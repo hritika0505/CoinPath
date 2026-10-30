@@ -25,7 +25,7 @@ export function getApiBaseUrl(): string {
   }
   // If running inside Capacitor Android (where protocol is capacitor: or file:), default to deployed or local IP
   if (typeof window !== 'undefined' && (window.location.protocol === 'capacitor:' || window.location.protocol === 'file:')) {
-    return 'http://10.0.2.2:3000'; // Standard Android emulator host loopback
+    return 'http://192.168.137.1:3000'; // Standard Android emulator host loopback
   }
   return '';
 }
