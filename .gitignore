@@ -6,19 +6,7 @@ coverage/
 *.log
 .env*
 !.env.example
-# Local database files
-*.db
-*.db-shm
-*.db-wal
-
-# Python cache files
-__pycache__/
-*.py[cod]
-
-# Environment secrets
-.env
-venv/
-.venv/
-
-# Node dependencies
-node_modules/
+# Local SQLite database files
+coinpath.db
+coinpath.db-shm
+coinpath.db-wal
