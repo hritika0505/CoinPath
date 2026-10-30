@@ -92,7 +92,7 @@ export default function App() {
           await setCachedTransactions(res.data.recentTransactions);
         }
 
-        await refreshOfflineState(res.data.wallet.balance);
+        await refreshOfflineState(res?.data?.wallet?.balance);
       } else if (res.status === 401) {
         // Session expired
         setStoredToken(null);
@@ -189,7 +189,7 @@ export default function App() {
     setUser(authedUser);
     setWallet(authedWallet);
     setCurrentTab('dashboard');
-    refreshOfflineState(authedWallet.balance);
+    refreshOfflineState(authedWallet?.balance);
     fetchWalletData();
   };
 

@@ -52,7 +52,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
     setTimeout(() => setCopied(false), 2000);
   };
 
-  const hasOfflineDeduction = wallet.balance !== conservativeBalance;
+  const hasOfflineDeduction = wallet?.balance !== conservativeBalance;
 
   return (
     <div className="space-y-5 pb-8">
@@ -102,9 +102,9 @@ export const Dashboard: React.FC<DashboardProps> = ({
 
           {hasOfflineDeduction && (
             <p className="text-xs text-amber-300/90 flex items-center gap-1 font-medium">
-              <span>Server balance: {wallet.balance.toLocaleString()}</span>
+              <span>Server balance: {wallet?.balance.toLocaleString()}</span>
               <span>·</span>
-              <span>({wallet.balance - conservativeBalance} queued offline)</span>
+              <span>({wallet?.balance - conservativeBalance} queued offline)</span>
             </p>
           )}
 

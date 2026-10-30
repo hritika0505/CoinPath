@@ -56,8 +56,8 @@ export const AuthScreens: React.FC<AuthProps> = ({ onAuthSuccess, showToast }) =
       }
 
       setStoredToken(res.data.token);
-      showToast('success', `Welcome back, ${res.data.user.fullName}!`, 'Login Successful');
-      onAuthSuccess(res.data.user, res.data.wallet);
+      showToast('success', `Welcome back, ${res?.data?.user?.fullName ?? 'User'}!`, 'Login Successful');
+      onAuthSuccess(res?.data?.user ?? { fullName: '' }, res.data.wallet ?? {balance : 0});
     } catch (err: any) {
       showToast('error', err.message || 'Network error during login.');
     } finally {
@@ -128,7 +128,7 @@ export const AuthScreens: React.FC<AuthProps> = ({ onAuthSuccess, showToast }) =
       setStoredToken(res.data.token);
       showToast(
         'success',
-        `Account created! Your wallet was initialized with ${res.data.wallet.balance} virtual coins.`,
+        `Account created! Your wallet was initialized with ${res?.data?.wallet?.balance} virtual coins.`,
         'Welcome to CoinPath'
       );
       onAuthSuccess(res.data.user, res.data.wallet);
