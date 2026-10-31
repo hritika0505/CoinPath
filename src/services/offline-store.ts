@@ -1,5 +1,10 @@
 import { openDB, DBSchema, IDBPDatabase } from 'idb';
-import { TransactionRecord, QueuedOfflineTransaction, WalletState } from '../types/wallet.ts';
+import {
+  TransactionRecord,
+  QueuedOfflineTransaction,
+  PendingIncomingTransfer,
+  WalletState,
+} from '../types/wallet.ts';
 
 interface CoinPathDB extends DBSchema {
   wallet_cache: {
@@ -16,17 +21,22 @@ interface CoinPathDB extends DBSchema {
     value: QueuedOfflineTransaction;
     indexes: { 'by-date': string };
   };
+  incoming_pending_queue: {
+    key: string;
+    value: PendingIncomingTransfer;
+    indexes: { 'by-date': string };
+  };
 }
 
 const DB_NAME = 'coinpath_offline_db';
-const DB_VERSION = 1;
+const DB_VERSION = 2; // Upgraded for incoming_pending_queue
 
 let dbPromise: Promise<IDBPDatabase<CoinPathDB>> | null = null;
 
 function getDB(): Promise<IDBPDatabase<CoinPathDB>> {
   if (!dbPromise) {
     dbPromise = openDB<CoinPathDB>(DB_NAME, DB_VERSION, {
-      upgrade(db) {
+      upgrade(db, oldVersion) {
         if (!db.objectStoreNames.contains('wallet_cache')) {
           db.createObjectStore('wallet_cache');
         }
@@ -38,6 +48,10 @@ function getDB(): Promise<IDBPDatabase<CoinPathDB>> {
           const queueStore = db.createObjectStore('offline_queue', { keyPath: 'txId' });
           queueStore.createIndex('by-date', 'queuedAt');
         }
+        if (!db.objectStoreNames.contains('incoming_pending_queue')) {
+          const incStore = db.createObjectStore('incoming_pending_queue', { keyPath: 'txId' });
+          incStore.createIndex('by-date', 'receivedAt');
+        }
       },
     });
   }
@@ -45,7 +59,7 @@ function getDB(): Promise<IDBPDatabase<CoinPathDB>> {
 }
 
 // -----------------------------------------------------------------------------
-// Offline Queue Operations
+// Outgoing Offline Queue Operations (Payments sent by user while offline)
 // -----------------------------------------------------------------------------
 
 export async function queueOfflineTransaction(tx: QueuedOfflineTransaction): Promise<void> {
@@ -71,6 +85,30 @@ export async function clearAllQueuedTransactions(): Promise<void> {
 export async function getPendingOfflineCount(): Promise<number> {
   const db = await getDB();
   return db.count('offline_queue');
+}
+
+// -----------------------------------------------------------------------------
+// Incoming Pending Transfers Operations (Transfers promised to recipient)
+// -----------------------------------------------------------------------------
+
+export async function recordIncomingPendingTransfer(incoming: PendingIncomingTransfer): Promise<void> {
+  const db = await getDB();
+  await db.put('incoming_pending_queue', incoming);
+}
+
+export async function getIncomingPendingTransfers(): Promise<PendingIncomingTransfer[]> {
+  const db = await getDB();
+  return db.getAll('incoming_pending_queue');
+}
+
+export async function removeIncomingPendingTransfer(txId: string): Promise<void> {
+  const db = await getDB();
+  await db.delete('incoming_pending_queue', txId);
+}
+
+export async function getIncomingPendingCount(): Promise<number> {
+  const db = await getDB();
+  return db.count('incoming_pending_queue');
 }
 
 // -----------------------------------------------------------------------------
@@ -104,12 +142,20 @@ export async function getCachedTransactions(): Promise<TransactionRecord[]> {
 
 /**
  * Calculates conservative effective balance:
- * (Cached balance minus sum of pending offline queued transactions)
+ * (Cached balance minus sum of pending offline queued debits)
  */
 export async function calculateConservativeBalance(baseBalance: number): Promise<number> {
   const queued = await getQueuedTransactions();
   const pendingTotal = queued.reduce((sum, item) => sum + item.amount, 0);
   return Math.max(0, baseBalance - pendingTotal);
+}
+
+/**
+ * Calculates expected total incoming pending coins for recipient
+ */
+export async function calculateIncomingPendingTotal(): Promise<number> {
+  const incoming = await getIncomingPendingTransfers();
+  return incoming.reduce((sum, item) => sum + item.amount, 0);
 }
 
 /**
@@ -121,5 +167,6 @@ export async function purgeLocalCache(preservePendingQueue = true): Promise<void
   await db.clear('transactions_cache');
   if (!preservePendingQueue) {
     await db.clear('offline_queue');
+    await db.clear('incoming_pending_queue');
   }
 }

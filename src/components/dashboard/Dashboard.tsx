@@ -14,7 +14,7 @@ import {
   ChevronRight,
   ShieldCheck,
 } from 'lucide-react';
-import { UserProfile, WalletState, TransactionRecord } from '../../types/wallet.ts';
+import { UserProfile, WalletState, TransactionRecord, PendingIncomingTransfer } from '../../types/wallet.ts';
 import { TabType } from '../common/BottomNav.tsx';
 
 interface DashboardProps {
@@ -24,6 +24,8 @@ interface DashboardProps {
   recentTransactions: TransactionRecord[];
   isOnline: boolean;
   pendingCount: number;
+  incomingPendingTransfers?: PendingIncomingTransfer[];
+  incomingPendingTotal?: number;
   onNavigateTab: (tab: TabType) => void;
   onOpenScanner?: () => void;
   onRequestFaucet: () => void;
@@ -38,6 +40,8 @@ export const Dashboard: React.FC<DashboardProps> = ({
   recentTransactions,
   isOnline,
   pendingCount,
+  incomingPendingTransfers = [],
+  incomingPendingTotal = 0,
   onNavigateTab,
   onOpenScanner,
   onRequestFaucet,
@@ -52,7 +56,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
     setTimeout(() => setCopied(false), 2000);
   };
 
-  const hasOfflineDeduction = wallet?.balance !== conservativeBalance;
+  const hasOfflineDeduction = wallet.balance !== conservativeBalance;
 
   return (
     <div className="space-y-5 pb-8">
@@ -102,9 +106,9 @@ export const Dashboard: React.FC<DashboardProps> = ({
 
           {hasOfflineDeduction && (
             <p className="text-xs text-amber-300/90 flex items-center gap-1 font-medium">
-              <span>Server balance: {wallet?.balance.toLocaleString()}</span>
+              <span>Server balance: {wallet.balance.toLocaleString()}</span>
               <span>·</span>
-              <span>({wallet?.balance - conservativeBalance} queued offline)</span>
+              <span>({wallet.balance - conservativeBalance} queued offline)</span>
             </p>
           )}
 
@@ -179,6 +183,35 @@ export const Dashboard: React.FC<DashboardProps> = ({
           <span className="text-xs font-semibold">Scan QR</span>
         </button>
       </div>
+
+      {/* Incoming Pending Vouchers Alert (When receiver has scanned an offline voucher) */}
+      {incomingPendingTotal > 0 && (
+        <div className="p-4 rounded-2xl bg-cyan-950/40 border border-cyan-800/60 flex items-center justify-between shadow-xl">
+          <div className="flex items-center gap-3">
+            <div className="w-9 h-9 rounded-xl bg-cyan-600/20 text-cyan-400 flex items-center justify-center">
+              <ArrowDownLeft className="w-5 h-5" />
+            </div>
+            <div>
+              <div className="text-xs font-bold text-cyan-200">
+                +{incomingPendingTotal} Coins Incoming ({incomingPendingTransfers.length} {incomingPendingTransfers.length === 1 ? 'Voucher' : 'Vouchers'})
+              </div>
+              <p className="text-[11px] text-cyan-300/80">
+                {isOnline
+                  ? 'Ready to sync: Click Sync Now to credit your ledger!'
+                  : 'Offline voucher registered: Coins will settle upon sync.'}
+              </p>
+            </div>
+          </div>
+
+          <button
+            onClick={onSyncNow}
+            disabled={!isOnline || isSyncing}
+            className="min-h-[40px] px-3 py-1.5 bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 text-slate-950 font-bold text-xs rounded-xl transition-colors cursor-pointer"
+          >
+            {isSyncing ? 'Syncing...' : 'Sync Now'}
+          </button>
+        </div>
+      )}
 
       {/* Pending Sync Card if offline transactions exist */}
       {pendingCount > 0 && (

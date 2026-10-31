@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import QRCode from 'qrcode';
 import {
   ArrowUpRight,
   QrCode,
@@ -9,8 +10,11 @@ import {
   UserCheck,
   Loader2,
   XCircle,
+  Copy,
+  Check,
+  Share2,
 } from 'lucide-react';
-import { UserProfile, WalletState } from '../../types/wallet.ts';
+import { UserProfile, WalletState, OfflinePaymentVoucherPayload } from '../../types/wallet.ts';
 import { apiRequest } from '../../services/api.ts';
 import { getSavedPrivateKey, signTransactionPayload } from '../../services/crypto.ts';
 import { queueOfflineTransaction } from '../../services/offline-store.ts';
@@ -24,6 +28,7 @@ interface SendCoinsProps {
   prefilledRecipient?: string;
   initialOpenScanner?: boolean;
   onTransferSuccess: () => void;
+  onVoucherScanned?: (voucher: OfflinePaymentVoucherPayload) => void;
   showToast: (type: 'success' | 'error' | 'info', message: string, title?: string) => void;
 }
 
@@ -35,11 +40,17 @@ export const SendCoins: React.FC<SendCoinsProps> = ({
   prefilledRecipient = '',
   initialOpenScanner = false,
   onTransferSuccess,
+  onVoucherScanned,
   showToast,
 }) => {
   const [recipientInput, setRecipientInput] = useState(prefilledRecipient);
   const [amountInput, setAmountInput] = useState('');
   const [showScanner, setShowScanner] = useState(initialOpenScanner);
+
+  // Offline Payment Voucher state for receiver to scan
+  const [offlineVoucher, setOfflineVoucher] = useState<OfflinePaymentVoucherPayload | null>(null);
+  const [voucherQrUrl, setVoucherQrUrl] = useState<string>('');
+  const [voucherCopied, setVoucherCopied] = useState(false);
 
   useEffect(() => {
     if (initialOpenScanner) {
@@ -195,9 +206,35 @@ export const SendCoins: React.FC<SendCoinsProps> = ({
           status: 'pending_sync',
         });
 
+        const voucherPayload: OfflinePaymentVoucherPayload = {
+          type: 'coinpath_payment_voucher',
+          version: 1,
+          txId,
+          senderWalletId: wallet.walletId,
+          senderName: user.fullName,
+          receiverWalletId: targetRecipient,
+          amount: numericAmount,
+          nonce,
+          signature: signatureHex,
+          timestamp: new Date().toISOString(),
+        };
+        setOfflineVoucher(voucherPayload);
+
+        try {
+          const dataUrl = await QRCode.toDataURL(JSON.stringify(voucherPayload), {
+            width: 280,
+            margin: 2,
+            color: { dark: '#080e1e', light: '#ffffff' },
+            errorCorrectionLevel: 'M',
+          });
+          setVoucherQrUrl(dataUrl);
+        } catch (qrErr) {
+          console.warn('Voucher QR generation notice:', qrErr);
+        }
+
         setTransferResult({
           status: 'queued_offline',
-          message: `Transfer of ${numericAmount} coins is queued offline. It will synchronize automatically when your device reconnects.`,
+          message: `Transfer of ${numericAmount} coins is queued offline. Show the voucher QR below to the recipient so their wallet registers the incoming payment immediately!`,
           txId,
         });
 
@@ -255,6 +292,17 @@ export const SendCoins: React.FC<SendCoinsProps> = ({
     setAmountInput('');
     setRecipientInput('');
     setVerifiedRecipient(null);
+    setOfflineVoucher(null);
+    setVoucherQrUrl('');
+    setVoucherCopied(false);
+  };
+
+  const handleCopyVoucher = () => {
+    if (!offlineVoucher) return;
+    navigator.clipboard.writeText(JSON.stringify(offlineVoucher));
+    setVoucherCopied(true);
+    showToast('success', 'Offline payment voucher copied to clipboard.');
+    setTimeout(() => setVoucherCopied(false), 2500);
   };
 
   return (
@@ -299,7 +347,58 @@ export const SendCoins: React.FC<SendCoinsProps> = ({
             <div>Tx ID: <span className="text-slate-200">{transferResult.txId}</span></div>
             <div>Recipient: <span className="text-slate-200">{recipientInput}</span></div>
             <div>Amount: <span className="text-emerald-400 font-bold">{numericAmount} coins</span></div>
+            {transferResult.status === 'queued_offline' && (
+              <div>Conservative Balance: <span className="text-amber-300 font-bold">{conservativeBalance} coins</span></div>
+            )}
           </div>
+
+          {/* If offline, present the signed offline voucher QR code so the receiver can scan it on the spot */}
+          {transferResult.status === 'queued_offline' && voucherQrUrl && (
+            <div className="p-4 rounded-2xl bg-amber-950/30 border border-amber-800/60 text-left space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2 text-amber-300 font-bold text-xs">
+                  <QrCode className="w-4 h-4" />
+                  <span>Show Voucher QR to Receiver</span>
+                </div>
+                <span className="text-[10px] text-amber-300 bg-amber-950 px-2 py-0.5 rounded-full border border-amber-800/80">
+                  Offline Handshake
+                </span>
+              </div>
+
+              <p className="text-[11px] text-slate-300 leading-relaxed">
+                The recipient can scan this QR code with their CoinPath app right now (even with zero internet). Their account will record the incoming payment immediately!
+              </p>
+
+              <div className="flex flex-col items-center p-3 bg-white rounded-xl shadow-lg">
+                <img
+                  src={voucherQrUrl}
+                  alt="CoinPath Offline Payment Voucher"
+                  className="w-48 h-48 object-contain"
+                />
+                <span className="text-[10px] text-slate-700 font-mono mt-1 font-semibold">
+                  Signed Voucher · {numericAmount} Coins
+                </span>
+              </div>
+
+              <button
+                type="button"
+                onClick={handleCopyVoucher}
+                className="w-full h-9 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors border border-slate-700 cursor-pointer"
+              >
+                {voucherCopied ? (
+                  <>
+                    <Check className="w-3.5 h-3.5 text-emerald-400" />
+                    <span className="text-emerald-400">Voucher Copied to Clipboard</span>
+                  </>
+                ) : (
+                  <>
+                    <Copy className="w-3.5 h-3.5 text-blue-400" />
+                    <span>Copy Voucher Code (For Manual Share)</span>
+                  </>
+                )}
+              </button>
+            </div>
+          )}
 
           <button
             onClick={handleResetForm}
@@ -534,6 +633,12 @@ export const SendCoins: React.FC<SendCoinsProps> = ({
           onScanSuccess={(payload) => {
             setRecipientInput(payload.walletId);
             setShowScanner(false);
+          }}
+          onVoucherScanned={(voucher) => {
+            setShowScanner(false);
+            if (onVoucherScanned) {
+              onVoucherScanned(voucher);
+            }
           }}
           onClose={() => setShowScanner(false)}
           showToast={showToast}

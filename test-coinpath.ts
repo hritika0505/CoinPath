@@ -225,8 +225,48 @@ async function runTests() {
     usernameOrEmail: testUsername,
     password: 'Password123!',
   });
-  assert(reLogin.status === 200, 'Re-login succeeds');
-  assert(reLogin.data.wallet.balance === 220, `Existing user balance preserved at 220 (NOT reset to 500)`);
+  // 17. Two-user offline payment and receiver voucher synchronization test
+  // Bob sends 40 coins to Alice while offline; Alice receives voucher and syncs first
+  const bobVoucherTxId = `voucher_tx_${Date.now()}`;
+  const bobVoucher = {
+    txId: bobVoucherTxId,
+    senderWalletId: bobWalletId,
+    receiverWalletId: aliceWalletId,
+    amount: 40,
+    nonce: `voucher_nonce_${Date.now()}`,
+    queuedAt: new Date().toISOString(),
+  };
+
+  // Alice logs in again to get fresh session
+  const aliceLogin = await post('/api/auth/login', {
+    usernameOrEmail: testUsername,
+    password: 'Password123!',
+  });
+  const currentAliceToken = aliceLogin.data.token;
+
+  // Alice (receiver) submits Bob's offline voucher when online
+  const receiverSyncRes = await post('/api/wallet/sync-offline', { transactions: [bobVoucher] }, currentAliceToken);
+  assert(receiverSyncRes.status === 200, 'Receiver sync of offline voucher processed with HTTP 200');
+  assert(receiverSyncRes.data.summary.syncedCount === 1, `Receiver sync accepted Bob's signed offline transfer (Actual: ${receiverSyncRes.data?.summary?.syncedCount})`);
+  assert(receiverSyncRes.data.summary.rejectedCount === 0, `No transactions rejected during receiver sync (Actual: ${receiverSyncRes.data?.summary?.rejectedCount})`);
+
+  // Verify Alice received the 40 coins (220 + 40 = 260)
+  const aliceAfterSync = await get('/api/wallet/me', currentAliceToken);
+  assert(aliceAfterSync.data.wallet.balance === 260, `Alice balance correctly credited to 260 (Actual: ${aliceAfterSync.data?.wallet?.balance})`);
+
+  // Verify Bob was debited 40 coins (780 - 40 = 740)
+  const bobAfterSync = await get('/api/wallet/me', bobToken);
+  assert(bobAfterSync.data.wallet.balance === 740, `Bob balance correctly debited to 740 (Actual: ${bobAfterSync.data?.wallet?.balance})`);
+
+  // Later, Bob comes online and tries to sync his queued transaction too
+  const senderSyncRes = await post('/api/wallet/sync-offline', { transactions: [bobVoucher] }, bobToken);
+  assert(senderSyncRes.status === 200, 'Sender sync of already processed voucher succeeds with HTTP 200');
+  assert(senderSyncRes.data.summary.alreadyProcessedCount === 1, `Sender sync reconciles already processed voucher without error (Actual: ${senderSyncRes.data?.summary?.alreadyProcessedCount})`);
+  assert(senderSyncRes.data.summary.rejectedCount === 0, `Sender sync does NOT mark reconciled transaction as rejected (Actual: ${senderSyncRes.data?.summary?.rejectedCount})`);
+
+  // Verify Bob's balance was not debited a second time
+  const bobFinal = await get('/api/wallet/me', bobToken);
+  assert(bobFinal.data.wallet.balance === 740, `Bob balance preserved at 740 without double-spending (Actual: ${bobFinal.data?.wallet?.balance})`);
 
   console.log(`\n================================`);
   console.log(`TEST SUMMARY: ${passed} PASSED, ${failed} FAILED`);

@@ -559,16 +559,26 @@ app.post('/api/wallet/sync-offline', requireAuth, (req: AuthenticatedRequest, re
 
     const numericAmount = Number(amount);
     const cleanReceiverId = String(receiverWalletId || '').trim();
+    // Allow item.senderWalletId if submitted by receiver voucher, defaulting to authenticated user's wallet
+    const actualSenderWalletId = String(item.senderWalletId || senderWalletId).trim();
 
-    // Check sender
-    const senderWallet = db.prepare('SELECT balance, max_tx_limit FROM wallets WHERE wallet_id = ?').get(senderWalletId) as any;
-    const maxLimit = senderWallet.max_tx_limit || 200;
+    // Look up sender's current wallet and user record
+    const senderWallet = db.prepare(`
+      SELECT w.id, w.balance, w.max_tx_limit, u.public_key, u.username, u.full_name
+      FROM wallets w
+      JOIN users u ON w.user_id = u.id
+      WHERE w.wallet_id = ?
+    `).get(actualSenderWalletId) as any;
+
+    const maxLimit = senderWallet?.max_tx_limit || 200;
 
     // Validation checks
     let rejectionReason: string | null = null;
-    if (!Number.isInteger(numericAmount) || numericAmount <= 0) {
+    if (!senderWallet) {
+      rejectionReason = `Sender wallet ${actualSenderWalletId} does not exist.`;
+    } else if (!Number.isInteger(numericAmount) || numericAmount <= 0) {
       rejectionReason = 'Invalid transfer amount.';
-    } else if (cleanReceiverId === senderWalletId) {
+    } else if (cleanReceiverId === actualSenderWalletId) {
       rejectionReason = 'Cannot transfer to self.';
     } else if (numericAmount > maxLimit) {
       rejectionReason = `Transfer limit exceeded. Maximum per transaction is ${maxLimit} coins.`;
@@ -584,23 +594,23 @@ app.post('/api/wallet/sync-offline', requireAuth, (req: AuthenticatedRequest, re
     // Nonce check
     const txNonce = nonce || `sync_nonce_${txId}`;
     if (!rejectionReason) {
-      const existingNonce = db.prepare('SELECT nonce FROM nonces WHERE sender_wallet_id = ? AND nonce = ?').get(senderWalletId, txNonce);
+      const existingNonce = db.prepare('SELECT nonce FROM nonces WHERE sender_wallet_id = ? AND nonce = ?').get(actualSenderWalletId, txNonce);
       if (existingNonce) {
         rejectionReason = 'Nonce replay detected.';
       }
     }
 
-    // Cryptographic signature check if present
-    if (!rejectionReason && req.user?.publicKey && signature) {
+    // Cryptographic signature check if sender has registered public key and signature is provided
+    if (!rejectionReason && senderWallet?.public_key && signature) {
       const payload = JSON.stringify({
-        senderWalletId,
+        senderWalletId: actualSenderWalletId,
         receiverWalletId: cleanReceiverId,
         amount: numericAmount,
         nonce: txNonce,
       });
 
       const isSigValid = verifyP256Signature({
-        publicKeySpkiBase64: req.user.publicKey,
+        publicKeySpkiBase64: senderWallet.public_key,
         payload,
         signatureHex: signature,
       });
@@ -621,7 +631,7 @@ app.post('/api/wallet/sync-offline', requireAuth, (req: AuthenticatedRequest, re
         `).run(
           txId,
           txNonce,
-          senderWalletId,
+          actualSenderWalletId,
           cleanReceiverId,
           numericAmount || 0,
           'rejected',
@@ -636,6 +646,7 @@ app.post('/api/wallet/sync-offline', requireAuth, (req: AuthenticatedRequest, re
 
       results.rejected.push({
         txId,
+        senderWalletId: actualSenderWalletId,
         receiverWalletId: cleanReceiverId,
         amount: numericAmount,
         reason: rejectionReason,
@@ -646,9 +657,9 @@ app.post('/api/wallet/sync-offline', requireAuth, (req: AuthenticatedRequest, re
     // Apply atomic commit
     db.exec('BEGIN TRANSACTION;');
     try {
-      db.prepare('UPDATE wallets SET balance = balance - ?, updated_at = ? WHERE wallet_id = ?').run(numericAmount, now, senderWalletId);
+      db.prepare('UPDATE wallets SET balance = balance - ?, updated_at = ? WHERE wallet_id = ?').run(numericAmount, now, actualSenderWalletId);
       db.prepare('UPDATE wallets SET balance = balance + ?, updated_at = ? WHERE wallet_id = ?').run(numericAmount, now, cleanReceiverId);
-      db.prepare('INSERT INTO nonces (sender_wallet_id, nonce, created_at) VALUES (?, ?, ?)').run(senderWalletId, txNonce, now);
+      db.prepare('INSERT INTO nonces (sender_wallet_id, nonce, created_at) VALUES (?, ?, ?)').run(actualSenderWalletId, txNonce, now);
 
       db.prepare(`
         INSERT INTO transactions (id, nonce, sender_wallet_id, receiver_wallet_id, amount, status, sync_status, signature, error_reason, created_at)
@@ -656,7 +667,7 @@ app.post('/api/wallet/sync-offline', requireAuth, (req: AuthenticatedRequest, re
       `).run(
         txId,
         txNonce,
-        senderWalletId,
+        actualSenderWalletId,
         cleanReceiverId,
         numericAmount,
         'accepted',
@@ -670,6 +681,7 @@ app.post('/api/wallet/sync-offline', requireAuth, (req: AuthenticatedRequest, re
 
       results.synced.push({
         txId,
+        senderWalletId: actualSenderWalletId,
         receiverWalletId: cleanReceiverId,
         amount: numericAmount,
         status: 'accepted',
@@ -678,6 +690,7 @@ app.post('/api/wallet/sync-offline', requireAuth, (req: AuthenticatedRequest, re
       db.exec('ROLLBACK;');
       results.rejected.push({
         txId,
+        senderWalletId: actualSenderWalletId,
         receiverWalletId: cleanReceiverId,
         amount: numericAmount,
         reason: 'Database atomic commit failure.',

@@ -32,6 +32,7 @@ export interface TransactionRecord {
 
 export interface QueuedOfflineTransaction {
   txId: string;
+  senderWalletId?: string;
   receiverWalletId: string;
   receiverName?: string;
   amount: number;
@@ -41,9 +42,35 @@ export interface QueuedOfflineTransaction {
   status: 'pending_sync';
 }
 
+export interface PendingIncomingTransfer {
+  txId: string;
+  senderWalletId: string;
+  senderName?: string;
+  receiverWalletId: string;
+  amount: number;
+  nonce: string;
+  signature?: string;
+  receivedAt: string;
+  status: 'pending_incoming';
+}
+
 export interface ReceiveQrPayload {
   type: 'coinpath_receive';
   version: 1;
   walletId: string;
   username?: string;
+}
+
+// Payment transfer receipt / voucher payload when sender shows receipt to receiver
+export interface OfflinePaymentVoucherPayload {
+  type: 'coinpath_payment_voucher';
+  version: 1;
+  txId: string;
+  senderWalletId: string;
+  senderName?: string;
+  receiverWalletId: string;
+  amount: number;
+  nonce: string;
+  signature?: string;
+  timestamp: string;
 }

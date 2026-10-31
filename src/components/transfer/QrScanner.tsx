@@ -14,10 +14,11 @@ import {
   Play,
   RotateCcw,
 } from 'lucide-react';
-import { ReceiveQrPayload } from '../../types/wallet.ts';
+import { ReceiveQrPayload, OfflinePaymentVoucherPayload } from '../../types/wallet.ts';
 
 interface QrScannerProps {
   onScanSuccess: (payload: ReceiveQrPayload) => void;
+  onVoucherScanned?: (voucher: OfflinePaymentVoucherPayload) => void;
   onClose: () => void;
   showToast: (type: 'success' | 'error' | 'info', message: string, title?: string) => void;
 }
@@ -27,7 +28,7 @@ interface VideoDevice {
   label: string;
 }
 
-export const QrScanner: React.FC<QrScannerProps> = ({ onScanSuccess, onClose, showToast }) => {
+export const QrScanner: React.FC<QrScannerProps> = ({ onScanSuccess, onVoucherScanned, onClose, showToast }) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -106,6 +107,30 @@ export const QrScanner: React.FC<QrScannerProps> = ({ onScanSuccess, onClose, sh
         }
       }
 
+      // 1. Check for Offline Payment Voucher payload (Sender paying Receiver while offline)
+      if (payload.type === 'coinpath_payment_voucher') {
+        if (!payload.txId || !payload.senderWalletId || !payload.amount) {
+          showToast('error', 'Malformed payment receipt payload.');
+          return;
+        }
+
+        setHasScanned(true);
+        stopCamera();
+        showToast('success', `Payment voucher received! +${payload.amount} coins pending sync.`);
+        if (onVoucherScanned) {
+          onVoucherScanned(payload);
+        } else {
+          onScanSuccess({
+            type: 'coinpath_receive',
+            version: 1,
+            walletId: payload.senderWalletId,
+            username: payload.senderName,
+          });
+        }
+        return;
+      }
+
+      // 2. Check for Standard Receive QR payload (Recipient address)
       if (payload.type !== 'coinpath_receive' || !payload.walletId) {
         showToast('error', 'Malformed CoinPath QR code format.');
         return;
@@ -118,7 +143,7 @@ export const QrScanner: React.FC<QrScannerProps> = ({ onScanSuccess, onClose, sh
     } catch {
       showToast('error', 'Failed to process QR code content.');
     }
-  }, [onScanSuccess, showToast, stopCamera]);
+  }, [onScanSuccess, onVoucherScanned, showToast, stopCamera]);
 
   // Frame scanning loop using jsqr
   const scanFrame = useCallback(() => {

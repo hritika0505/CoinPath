@@ -10,12 +10,13 @@ import {
   ShieldCheck,
   RefreshCw,
 } from 'lucide-react';
-import { TransactionRecord, QueuedOfflineTransaction, WalletState } from '../../types/wallet.ts';
+import { TransactionRecord, QueuedOfflineTransaction, PendingIncomingTransfer, WalletState } from '../../types/wallet.ts';
 
 interface TransactionHistoryProps {
   wallet: WalletState;
   transactions: TransactionRecord[];
   queuedTransactions: QueuedOfflineTransaction[];
+  incomingPendingTransfers?: PendingIncomingTransfer[];
   isLoading: boolean;
   onRefresh: () => void;
 }
@@ -24,6 +25,7 @@ export const TransactionHistory: React.FC<TransactionHistoryProps> = ({
   wallet,
   transactions,
   queuedTransactions,
+  incomingPendingTransfers = [],
   isLoading,
   onRefresh,
 }) => {
@@ -45,10 +47,25 @@ export const TransactionHistory: React.FC<TransactionHistoryProps> = ({
     created_at: q.queuedAt,
   }));
 
+  // Merge incoming pending vouchers as synthetic records
+  const syntheticIncomingRecords: TransactionRecord[] = incomingPendingTransfers.map((inc) => ({
+    id: inc.txId,
+    nonce: inc.nonce,
+    sender_wallet_id: inc.senderWalletId,
+    receiver_wallet_id: inc.receiverWalletId,
+    amount: inc.amount,
+    status: 'pending_sync',
+    sync_status: 'queued_offline',
+    signature: inc.signature || null,
+    error_reason: null,
+    created_at: inc.receivedAt,
+  }));
+
   // Combine unique by id
   const existingIds = new Set(transactions.map((t) => t.id));
   const combined = [
     ...syntheticPendingRecords.filter((p) => !existingIds.has(p.id)),
+    ...syntheticIncomingRecords.filter((p) => !existingIds.has(p.id)),
     ...transactions,
   ].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
 
@@ -178,13 +195,21 @@ export const TransactionHistory: React.FC<TransactionHistoryProps> = ({
                       <span
                         className={
                           isPending
-                            ? 'text-amber-400 font-medium'
+                            ? isSent
+                              ? 'text-amber-400 font-medium'
+                              : 'text-cyan-400 font-medium'
                             : isRejected
                             ? 'text-rose-400 font-medium'
                             : 'text-emerald-400 font-medium'
                         }
                       >
-                        {isPending ? 'Queued Offline' : isRejected ? 'Rejected' : 'Accepted'}
+                        {isPending
+                          ? isSent
+                            ? 'Queued Offline'
+                            : 'Incoming Voucher (Pending Sync)'
+                          : isRejected
+                          ? 'Rejected'
+                          : 'Accepted'}
                       </span>
                     </div>
                   </div>
@@ -193,10 +218,14 @@ export const TransactionHistory: React.FC<TransactionHistoryProps> = ({
                 <div className="text-right">
                   <div
                     className={`text-sm font-bold font-mono tabular-nums ${
-                      isSent ? 'text-slate-200' : 'text-emerald-400'
+                      isPending && !isSent
+                        ? 'text-cyan-400'
+                        : isSent
+                        ? 'text-slate-200'
+                        : 'text-emerald-400'
                     }`}
                   >
-                    {isSent ? `-${tx.amount}` : `+${tx.amount}`}
+                    {isSent ? `-${tx.amount}` : isPending ? `+${tx.amount} (Pending)` : `+${tx.amount}`}
                   </div>
                   <div className="text-[10px] text-slate-400 font-mono">{tx.id.substring(0, 10)}...</div>
                 </div>

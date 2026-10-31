@@ -10,7 +10,7 @@ import { TransactionHistory } from './components/history/TransactionHistory.tsx'
 import { ProfileSettings } from './components/profile/ProfileSettings.tsx';
 import { AndroidGuideModal } from './components/android/AndroidGuideModal.tsx';
 
-import { UserProfile, WalletState, TransactionRecord, QueuedOfflineTransaction } from './types/wallet.ts';
+import { UserProfile, WalletState, TransactionRecord, QueuedOfflineTransaction, PendingIncomingTransfer, OfflinePaymentVoucherPayload } from './types/wallet.ts';
 import { apiRequest, getStoredToken, setStoredToken } from './services/api.ts';
 import { networkMonitor } from './services/network.ts';
 import {
@@ -22,6 +22,10 @@ import {
   removeQueuedTransaction,
   getPendingOfflineCount,
   calculateConservativeBalance,
+  getIncomingPendingTransfers,
+  removeIncomingPendingTransfer,
+  recordIncomingPendingTransfer,
+  calculateIncomingPendingTotal,
 } from './services/offline-store.ts';
 
 export default function App() {
@@ -30,6 +34,8 @@ export default function App() {
   const [conservativeBalance, setConservativeBalance] = useState<number>(0);
   const [recentTransactions, setRecentTransactions] = useState<TransactionRecord[]>([]);
   const [queuedTransactions, setQueuedTransactions] = useState<QueuedOfflineTransaction[]>([]);
+  const [incomingPendingTransfers, setIncomingPendingTransfers] = useState<PendingIncomingTransfer[]>([]);
+  const [incomingPendingTotal, setIncomingPendingTotal] = useState<number>(0);
   const [pendingCount, setPendingCount] = useState<number>(0);
 
   const [currentTab, setCurrentTab] = useState<TabType>('dashboard');
@@ -58,13 +64,18 @@ export default function App() {
     setToasts((prev) => prev.filter((t) => t.id !== id));
   };
 
-  // Recalculate conservative balance & pending queue
+  // Recalculate conservative balance & pending queues (both outgoing & incoming)
   const refreshOfflineState = useCallback(async (currentWalletBalance?: number) => {
     try {
       const queued = await getQueuedTransactions();
       const count = await getPendingOfflineCount();
+      const incoming = await getIncomingPendingTransfers();
+      const incTotal = await calculateIncomingPendingTotal();
+
       setQueuedTransactions(queued);
-      setPendingCount(count);
+      setIncomingPendingTransfers(incoming);
+      setIncomingPendingTotal(incTotal);
+      setPendingCount(count + incoming.length);
 
       const base = typeof currentWalletBalance === 'number' ? currentWalletBalance : wallet?.balance || 0;
       const conservative = await calculateConservativeBalance(base);
@@ -92,7 +103,7 @@ export default function App() {
           await setCachedTransactions(res.data.recentTransactions);
         }
 
-        await refreshOfflineState(res?.data?.wallet?.balance);
+        await refreshOfflineState(res.data.wallet.balance);
       } else if (res.status === 401) {
         // Session expired
         setStoredToken(null);
@@ -111,28 +122,61 @@ export default function App() {
     }
   }, [refreshOfflineState, user?.walletId]);
 
-  // Sync offline queued transactions with server
+  // Sync offline queued transactions and incoming vouchers with server
   const syncOfflineTransactions = useCallback(async () => {
     if (!isOnline || isSyncing) return;
 
     try {
       const queued = await getQueuedTransactions();
-      if (queued.length === 0) return;
+      const incoming = await getIncomingPendingTransfers();
+
+      const totalCount = queued.length + incoming.length;
+      if (totalCount === 0) return;
 
       setIsSyncing(true);
-      showToast('info', `Synchronizing ${queued.length} queued transactions...`, 'Sync in Progress');
+      showToast('info', `Synchronizing ${totalCount} offline transactions with ledger...`, 'Sync in Progress');
+
+      const outgoingPayloads = queued.map((item) => ({
+        txId: item.txId,
+        senderWalletId: item.senderWalletId || wallet?.walletId,
+        receiverWalletId: item.receiverWalletId,
+        amount: item.amount,
+        nonce: item.nonce,
+        signature: item.signature,
+        queuedAt: item.queuedAt,
+      }));
+
+      const incomingPayloads = incoming.map((item) => ({
+        txId: item.txId,
+        senderWalletId: item.senderWalletId,
+        receiverWalletId: item.receiverWalletId,
+        amount: item.amount,
+        nonce: item.nonce,
+        signature: item.signature,
+        queuedAt: item.receivedAt,
+      }));
+
+      // Deduplicate by txId
+      const uniqueMap = new Map<string, any>();
+      for (const item of [...outgoingPayloads, ...incomingPayloads]) {
+        uniqueMap.set(item.txId, item);
+      }
+      const combinedTransactions = Array.from(uniqueMap.values());
 
       const res = await apiRequest('/api/wallet/sync-offline', {
         method: 'POST',
-        body: JSON.stringify({ transactions: queued }),
+        body: JSON.stringify({ transactions: combinedTransactions }),
       });
 
       if (res.data?.summary) {
         const { syncedCount, rejectedCount, alreadyProcessedCount } = res.data.summary;
 
-        // Clear successfully processed transactions from offline queue
+        // Clear successfully processed transactions from offline queues
         for (const item of queued) {
           await removeQueuedTransaction(item.txId);
+        }
+        for (const inc of incoming) {
+          await removeIncomingPendingTransfer(inc.txId);
         }
 
         if (typeof res.data.currentBalance === 'number') {
@@ -141,8 +185,8 @@ export default function App() {
 
         showToast(
           'success',
-          `Sync complete: ${syncedCount} accepted, ${rejectedCount} rejected, ${alreadyProcessedCount} reconciled.`,
-          'Synchronization Success'
+          `Sync complete: ${syncedCount} accepted, ${alreadyProcessedCount} reconciled, ${rejectedCount} rejected.`,
+          'Synchronization Complete'
         );
 
         // Refresh entire ledger
@@ -156,7 +200,41 @@ export default function App() {
       setIsSyncing(false);
       await refreshOfflineState();
     }
-  }, [isOnline, isSyncing, showToast, fetchWalletData, refreshOfflineState]);
+  }, [isOnline, isSyncing, showToast, wallet?.walletId, fetchWalletData, refreshOfflineState]);
+
+  // Handler when recipient scans an offline payment voucher from sender
+  const handleVoucherScanned = useCallback(async (voucher: OfflinePaymentVoucherPayload) => {
+    try {
+      await recordIncomingPendingTransfer({
+        txId: voucher.txId,
+        senderWalletId: voucher.senderWalletId,
+        senderName: voucher.senderName,
+        receiverWalletId: voucher.receiverWalletId,
+        amount: voucher.amount,
+        nonce: voucher.nonce,
+        signature: voucher.signature,
+        receivedAt: voucher.timestamp || new Date().toISOString(),
+        status: 'pending_incoming',
+      });
+
+      showToast(
+        'success',
+        `Incoming payment of ${voucher.amount} coins from ${voucher.senderWalletId} recorded! Will settle upon sync.`,
+        'Voucher Registered'
+      );
+
+      await refreshOfflineState();
+
+      // If already online, trigger immediate synchronization
+      if (networkMonitor.isOnline()) {
+        setTimeout(() => {
+          syncOfflineTransactions();
+        }, 400);
+      }
+    } catch (err: any) {
+      showToast('error', err.message || 'Failed to record incoming voucher.');
+    }
+  }, [showToast, refreshOfflineState, syncOfflineTransactions]);
 
   // Network monitor subscription
   useEffect(() => {
@@ -189,7 +267,7 @@ export default function App() {
     setUser(authedUser);
     setWallet(authedWallet);
     setCurrentTab('dashboard');
-    refreshOfflineState(authedWallet?.balance);
+    refreshOfflineState(authedWallet.balance);
     fetchWalletData();
   };
 
@@ -289,6 +367,8 @@ export default function App() {
             recentTransactions={recentTransactions}
             isOnline={isOnline}
             pendingCount={pendingCount}
+            incomingPendingTransfers={incomingPendingTransfers}
+            incomingPendingTotal={incomingPendingTotal}
             onNavigateTab={(tab) => {
               setOpenScannerOnSend(false);
               setCurrentTab(tab);
@@ -311,6 +391,7 @@ export default function App() {
             isOnline={isOnline}
             initialOpenScanner={openScannerOnSend}
             onTransferSuccess={handleTransferSuccess}
+            onVoucherScanned={handleVoucherScanned}
             showToast={showToast}
           />
         )}
@@ -320,6 +401,7 @@ export default function App() {
             user={user}
             wallet={wallet}
             showToast={showToast}
+            onVoucherReceived={handleVoucherScanned}
           />
         )}
 
@@ -328,6 +410,7 @@ export default function App() {
             wallet={wallet}
             transactions={recentTransactions}
             queuedTransactions={queuedTransactions}
+            incomingPendingTransfers={incomingPendingTransfers}
             isLoading={isHistoryLoading}
             onRefresh={handleRefreshHistory}
           />
